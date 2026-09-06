@@ -1,9 +1,8 @@
 fastapi
 uvicorn
-requests
-numpy
-pandas
-pandas-ta==0.3.14b0
+numpy==1.26.4
+pandas==2.2.2
+pandas-ta
 yfinance
 beautifulsoup4
 supabase
