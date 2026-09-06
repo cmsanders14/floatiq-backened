@@ -2,7 +2,7 @@ fastapi
 uvicorn
 numpy==1.26.4
 pandas==2.2.2
-git+https://github.com
+pandas-ta==0.3.14b
 yfinance
 beautifulsoup4
 supabase
