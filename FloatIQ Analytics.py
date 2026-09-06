@@ -11,8 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
 load_dotenv()
-SUPABASE_URL = "https://wupivkrdqgrzogdaoueu.supabase.co"
-SUPABASE_SERVICE_KEY = "sb_secret_yjY39ocnjMYZTm8cwlNvkQ_mkqETZni"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 app = FastAPI(title="FloatIQ Analytics Engine", version="3.0.0")
