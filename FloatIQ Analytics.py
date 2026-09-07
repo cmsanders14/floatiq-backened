@@ -11,8 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
 load_dotenv()
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_URL = "https://wupivkrdqgrzogdaoueu.supabase.co"
+SUPABASE_SERVICE_KEY = "sb_secret_yjY39ocnjMYZTm8cwlNvkQ_mkqETZni"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 app = FastAPI(title="FloatIQ Analytics Engine", version="3.0.0")
@@ -81,7 +81,10 @@ def get_probabilities(
         df['rvol'] = df['Volume'] / df['volume_ma20']
         df.ta.cdl_pattern(name="all", append=True)
         pattern_cols = [col for col in df.columns if col.startswith('CDL_')]
-
+        print(f"DEBUG {ticker}: dataframe rows = {len(df)}")
+        print(f"DEBUG {ticker}: patter_columns = {len(pattern_cols)}")
+        print(f"DEBUG {ticker}: first pattern column = {pattern_cols[:10]}")
+        
         results = []
         is_intraday = "m" in chart_interval or "h" in chart_interval
         lookahead_candles = 15 if chart_interval == "1m" else (6 if chart_interval in ["5m", "15m"] else 5)
@@ -193,7 +196,7 @@ def get_probabilities(
                         "supernova_100pct_probability": f"{supernova_probability}%",
                         "vwap_void_dist": abs(df['Close'].iloc[i] - df['vwap'].iloc[i]) / df['vwap'].iloc[i]
                     })
-
+        print(f"DEBUG {ticker}: final raw results = {len(results)}")
         if not results:
             return {"ticker": ticker.upper(), "current_market_environment": market_status, "asset_categories": asset_class_tags, "patterns": []}
 
