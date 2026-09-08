@@ -2,7 +2,7 @@ import os
 import requests
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import yfinance as yf
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
