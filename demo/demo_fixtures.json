@@ -1,0 +1,78 @@
+{
+  "warning": "DEMO DATA ONLY - never display as a live market event",
+  "market_alerts": [
+    {
+      "ticker": "DEMO",
+      "event_type": "institutional_scale_trade",
+      "verification_status": "potential",
+      "side": "buy",
+      "shares": 20000,
+      "price": 120.58,
+      "notional_value": 2411600,
+      "relative_volume": 5.4,
+      "message": "Demo: potential institutional-scale trade, 20,000 shares at $120.58 ($2.41M). Buyer identity is not public."
+    },
+    {
+      "ticker": "DEMO",
+      "event_type": "verified_insider_purchase",
+      "verification_status": "verified_public_filing",
+      "side": "buy",
+      "shares": 5000,
+      "price": 42.25,
+      "notional_value": 211250,
+      "actor_name": "Sample Executive",
+      "actor_role": "Chief Executive Officer",
+      "source_name": "Demo public filing",
+      "message": "Demo: a public filing identifies a sample executive purchase."
+    }
+  ],
+  "discipline_evaluation": {
+    "ticker": "DEMO",
+    "mode": "coach",
+    "discipline_gate_passed": true,
+    "requires_acknowledgement": false,
+    "broker_order_submitted": false,
+    "investment_recommendation": false,
+    "metrics": {
+      "planned_position_value": 5000,
+      "planned_position_value_pct": 50,
+      "planned_risk": 250,
+      "planned_risk_pct": 2.5,
+      "reward_to_risk": 2
+    },
+    "violations": [
+      {
+        "rule_key": "max_position_value_pct",
+        "source": "user_defined_rule",
+        "observed": 50,
+        "user_limit": 20,
+        "message": "This plan exceeds your saved maximum position value."
+      }
+    ]
+  },
+  "analog_search": {
+    "reference": {
+      "ticker": "TSLA",
+      "era_label": "Curated pre-breakout example",
+      "window_start": "2019-01-02",
+      "window_end": "2019-12-31"
+    },
+    "experimental": true,
+    "prediction_disclaimer": "Similarity to a historical company stage does not predict the same future outcome.",
+    "matches": [
+      {
+        "ticker": "DEMO",
+        "company_name": "Sample Company",
+        "similarity_score": 84.6,
+        "shared_features_compared": 8,
+        "similarities": [
+          {"label": "volume growth", "component_similarity": 92.0},
+          {"label": "market-cap stage", "component_similarity": 88.0}
+        ],
+        "differences": [
+          {"label": "revenue growth", "component_similarity": 34.0}
+        ]
+      }
+    ]
+  }
+}
