@@ -103,6 +103,15 @@ class FloatIQTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"")
 
+    def test_launch_status_exposes_flags_without_allowlist(self):
+        response = client.get("/api/launch-status")
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["release_channel"], "invite_only_beta")
+        self.assertNotIn("allowlist", result)
+        self.assertEqual(result["algorithm_versions"]["session_opportunity"], "session_opportunity_v1")
+        self.assertEqual(result["algorithm_versions"]["supernova"], "supernova_v1")
+
     def test_http_private_route_is_protected(self):
         response = client.get("/api/user-journal-summary")
         self.assertEqual(response.status_code, 401)
@@ -198,6 +207,19 @@ class FloatIQTests(unittest.TestCase):
         self.assertGreaterEqual(interval["low_pct"], 0)
         self.assertLessEqual(interval["high_pct"], 100)
         self.assertGreater(interval["high_pct"] - interval["low_pct"], 50)
+
+    def test_claim_readiness_hides_small_sample_win_rate(self):
+        with patch.object(
+            floatiq,
+            "require_authenticated_tier",
+            return_value=("user-1", {"tier": "premium_scanner"}),
+        ):
+            small = floatiq.get_claim_readiness(successes=9, total=10)
+            ready = floatiq.get_claim_readiness(successes=27, total=30)
+        self.assertFalse(small["win_rate_display_allowed"])
+        self.assertIsNone(small["confidence_interval_95"])
+        self.assertTrue(ready["win_rate_display_allowed"])
+        self.assertIsNotNone(ready["confidence_interval_95"])
 
     def test_daily_reveal_uses_atomic_database_function(self):
         database = FakeRpcSupabase(True)
@@ -349,9 +371,149 @@ class FloatIQTests(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         self.assertFalse(result["custom_thresholds_available"])
 
+    def test_session_scanner_is_prebuilt_and_waits_for_licensed_feed(self):
+        with patch.object(
+            floatiq,
+            "require_authenticated_tier",
+            return_value=("user-1", floatiq.tier_entitlements("premium_scanner")),
+        ), patch.object(floatiq, "SESSION_SCANNER_FEED_ENABLED", False):
+            result = floatiq.get_session_opportunities(
+                asset_type=None,
+                market_session=None,
+                weekend_only=True,
+                minimum_score=40,
+                include_unconfirmed=False,
+                limit=10,
+            )
+        self.assertTrue(result["scanner"]["weekend_capable"])
+        self.assertEqual(result["data_status"], "awaiting_live_feed")
+        self.assertEqual(result["candidates"], [])
+        self.assertIn("chart availability alone", result["tradability_disclaimer"])
+
+    def test_session_opportunity_keeps_broker_support_explicit(self):
+        now = datetime(2026, 9, 12, 14, tzinfo=timezone.utc)
+        candidate = floatiq.SessionOpportunityInput(
+            ticker="BTC-USD",
+            asset_type="crypto",
+            price=60_000,
+            relative_volume=6,
+            average_dollar_volume=500_000_000,
+            spread_bps=5,
+            price_change_pct=4,
+            range_breakout_pct=3,
+            vwap_distance_pct=2,
+            observed_at=now - timedelta(seconds=15),
+            market_session="continuous",
+            provider_supports_session=True,
+        )
+        result = floatiq.score_session_opportunity(candidate, now=now)
+        self.assertTrue(result["chartable"])
+        self.assertTrue(result["scanner_eligible"])
+        self.assertFalse(result["potentially_tradable"])
+        self.assertEqual(result["tradability_status"], "broker_support_unknown")
+        self.assertFalse(result["trade_execution_available"])
+
+    def test_session_opportunity_carries_versioned_market_regime(self):
+        now = datetime(2026, 9, 14, 14, tzinfo=timezone.utc)
+        candidate = floatiq.SessionOpportunityInput(
+            ticker="PLTR",
+            price=120,
+            relative_volume=3,
+            average_dollar_volume=50_000_000,
+            spread_bps=8,
+            price_change_pct=2,
+            range_breakout_pct=1,
+            vwap_distance_pct=1,
+            observed_at=now - timedelta(seconds=10),
+            market_session="regular",
+            provider_supports_session=True,
+            benchmark_change_pct=-1.2,
+            benchmark_above_20d_ma=False,
+            market_breadth_pct=25,
+            volatility_percentile=70,
+            liquidity_status="normal",
+        )
+        result = floatiq.score_session_opportunity(candidate, now=now)
+        self.assertEqual(result["market_regime"], "bearish_trend")
+        self.assertEqual(result["algorithm_version"], "session_opportunity_v1")
+
+    def test_session_feed_circuit_breaker_halts_duplicate_batch(self):
+        now = datetime.now(timezone.utc)
+        row = {
+            "source_name": "licensed_feed",
+            "source_event_id": "duplicate-1",
+            "ticker": "BTC-USD",
+            "asset_type": "crypto",
+            "price": 60_000,
+            "relative_volume": 3,
+            "average_dollar_volume": 100_000_000,
+            "spread_bps": 5,
+            "price_change_pct": 2,
+            "range_breakout_pct": 1,
+            "vwap_distance_pct": 1,
+            "observed_at": (now - timedelta(seconds=5)).isoformat(),
+            "received_at": now.isoformat(),
+            "market_session": "continuous",
+            "provider_supports_session": True,
+        }
+        with patch.object(
+            floatiq,
+            "require_authenticated_tier",
+            return_value=("user-1", floatiq.tier_entitlements("premium_scanner")),
+        ), patch.object(floatiq, "SESSION_SCANNER_FEED_ENABLED", True), patch.object(
+            floatiq, "BETA_ALLOWLIST_USER_IDS", {"user-1"}
+        ), patch.object(floatiq, "supabase", FakeSupabase([row, row])):
+            result = floatiq.get_session_opportunities(
+                asset_type=None,
+                market_session=None,
+                weekend_only=False,
+                minimum_score=40,
+                include_unconfirmed=False,
+                limit=10,
+            )
+        self.assertEqual(result["data_status"], "feed_halted")
+        self.assertEqual(result["candidates"], [])
+        self.assertIn("duplicate_source_events", result["data_quality"]["reason_codes"])
+
+    def test_session_opportunity_rejects_naive_observation_time(self):
+        candidate = floatiq.SessionOpportunityInput(
+            ticker="PLTR",
+            asset_type="equity",
+            price=120,
+            relative_volume=2,
+            average_dollar_volume=20_000_000,
+            spread_bps=10,
+            price_change_pct=1,
+            range_breakout_pct=1,
+            vwap_distance_pct=1,
+            observed_at=datetime(2026, 9, 12, 14),
+        )
+        with self.assertRaises(HTTPException) as exc:
+            floatiq.score_session_opportunity(candidate)
+        self.assertEqual(exc.exception.status_code, 422)
+
+    def test_session_opportunity_rejects_naive_received_time(self):
+        observed = datetime(2026, 9, 12, 14, tzinfo=timezone.utc)
+        candidate = floatiq.SessionOpportunityInput(
+            ticker="PLTR",
+            price=120,
+            relative_volume=2,
+            average_dollar_volume=20_000_000,
+            spread_bps=10,
+            price_change_pct=1,
+            range_breakout_pct=1,
+            vwap_distance_pct=1,
+            observed_at=observed,
+            received_at=datetime(2026, 9, 12, 14),
+        )
+        with self.assertRaises(HTTPException) as exc:
+            floatiq.score_session_opportunity(candidate, now=observed)
+        self.assertEqual(exc.exception.status_code, 422)
+
     def test_supernova_radar_drops_stale_cache_rows(self):
         now = datetime.now(timezone.utc)
         metrics = {
+            "price": 10,
             "relative_volume_at_time": 5,
             "price_change_pct": 4,
             "average_dollar_volume": 5_000_000,
@@ -359,15 +521,17 @@ class FloatIQTests(unittest.TestCase):
             "direction": "up",
         }
         rows = [
-            {"ticker": "FRESH", "score": 80, "updated_at": now.isoformat(), **metrics},
-            {"ticker": "WATCH", "score": 45, "updated_at": now.isoformat(), **metrics},
-            {"ticker": "STALE", "score": 99, "updated_at": (now - timedelta(hours=1)).isoformat(), **metrics},
+            {"ticker": "FRESH", "score": 80, "updated_at": now.isoformat(), "source_name": "feed", "source_event_id": "1", **metrics},
+            {"ticker": "WATCH", "score": 45, "updated_at": now.isoformat(), "source_name": "feed", "source_event_id": "2", **metrics},
+            {"ticker": "STALE", "score": 99, "updated_at": (now - timedelta(hours=1)).isoformat(), "source_name": "feed", "source_event_id": "3", **metrics},
         ]
         with patch.object(
             floatiq,
             "require_authenticated_tier",
             return_value=("user-1", floatiq.tier_entitlements("autonomous_bot")),
         ), patch.object(floatiq, "SUPERNOVA_FEED_ENABLED", True), patch.object(
+            floatiq, "BETA_ALLOWLIST_USER_IDS", {"user-1"}
+        ), patch.object(
             floatiq, "supabase", FakeSupabase(rows)
         ):
             result = floatiq.get_supernova_radar(limit=25)

@@ -23,6 +23,9 @@
 9. `008_reconcile_legacy_schema_and_lock_down_data_api.sql`
 10. `009_advisor_performance_cleanup.sql`
 11. `010_billing_and_notification_delivery.sql`
+12. `011_session_aware_scanner.sql`
+13. `012_accuracy_ledger_and_launch_controls.sql`
+14. `013_accuracy_ledger_index_cleanup.sql`
 
 ## Pricing and dashboard limits
 
@@ -66,6 +69,34 @@ not exist for that signed-in account.
 
 In-app notifications require no device-provider key. Push and web-push switches should remain
 hidden until the backend reports a configured delivery provider in a future contract.
+
+## Session-aware opportunity scanner
+
+Call `GET /api/scanners/session-opportunities` for Pro or Elite users. Optional filters are
+`asset_type`, `market_session`, `weekend_only`, `minimum_score`, `include_unconfirmed`, and
+`limit`. Keep the screen in a neutral "Awaiting live feed" state when
+`$.data_status=awaiting_live_feed`; never substitute demo symbols.
+
+For each candidate, display `chartable`, `data_status`, `data_age_seconds`, `market_session`,
+`session_source`, `tradability_status`, and `potentially_tradable` independently. Only describe
+an item as potentially tradable when the last field is true. A fresh chart with
+`broker_support_unknown` remains useful for analysis but is not a broker availability claim.
+
+Use `ranking_score`, `score_components`, and `reason_codes` to explain ordering. The ranking is
+an observations filter, not a prediction or recommendation. The production feed switch remains
+off until a licensed adapter has passed timestamp, session, stale-data, and weekend coverage
+tests.
+
+Before showing any live candidate, read `GET /api/launch-status`. Treat `prelaunch` as unavailable,
+`invite_only_beta` as visibly labeled testing access, and `public` as the only general-release
+state. Never infer beta membership in FlutterFlow; the backend returns HTTP 403 for users who are
+not invited.
+
+When `$.data_status=feed_halted`, show a temporary data-quality message and no candidates. Do not
+reuse cached results from a prior response. Display a historical win rate only when
+`$.win_rate_display_allowed=true`; otherwise show the sample count and "Collecting more examples."
+Keep `algorithm_version`, `market_regime`, and sample metadata attached to accuracy screens so
+different rule versions and market conditions are never combined silently.
 
 ## Pattern search
 

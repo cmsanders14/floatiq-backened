@@ -37,6 +37,19 @@ from floatiq_core.brokers import (
     validate_idempotency_key,
 )
 from floatiq_core.market_data import _MARKET_DATA_CACHE, download_market_data
+from floatiq_core.market_sessions import (
+    assess_market_availability,
+    normalize_asset_type,
+    normalize_market_session,
+    rank_session_candidate,
+    require_aware_utc,
+)
+from floatiq_core.launch_safety import (
+    assess_feed_batch,
+    beta_access_status,
+    classify_market_regime,
+    statistical_claim_status,
+)
 from floatiq_core.notifications import delivery_rows, notification_event_row, normalize_channels
 from floatiq_core.rate_limit import SlidingWindowRateLimiter
 logger = logging.getLogger("floatiq")
@@ -61,6 +74,32 @@ SUPERNOVA_FEED_ENABLED = os.getenv("SUPERNOVA_FEED_ENABLED", "false").strip().lo
 SUPERNOVA_CACHE_MAX_AGE_SECONDS = max(
     30, int(os.getenv("SUPERNOVA_CACHE_MAX_AGE_SECONDS", "120"))
 )
+SESSION_SCANNER_FEED_ENABLED = (
+    os.getenv("SESSION_SCANNER_FEED_ENABLED", "false").strip().lower() == "true"
+)
+SESSION_SCANNER_CACHE_MAX_AGE_SECONDS = max(
+    30, int(os.getenv("SESSION_SCANNER_CACHE_MAX_AGE_SECONDS", "120"))
+)
+SCANNER_ALGORITHM_VERSION = os.getenv(
+    "SCANNER_ALGORITHM_VERSION", "session_opportunity_v1"
+).strip()
+if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", SCANNER_ALGORITHM_VERSION):
+    raise RuntimeError("SCANNER_ALGORITHM_VERSION has an invalid format")
+SUPERNOVA_ALGORITHM_VERSION = os.getenv(
+    "SUPERNOVA_ALGORITHM_VERSION", "supernova_v1"
+).strip()
+if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", SUPERNOVA_ALGORITHM_VERSION):
+    raise RuntimeError("SUPERNOVA_ALGORITHM_VERSION has an invalid format")
+MINIMUM_WIN_RATE_SAMPLE_SIZE = max(
+    30, int(os.getenv("MINIMUM_WIN_RATE_SAMPLE_SIZE", "30"))
+)
+BETA_MODE_ENABLED = os.getenv("BETA_MODE_ENABLED", "true").strip().lower() == "true"
+PUBLIC_LAUNCH_ENABLED = os.getenv("PUBLIC_LAUNCH_ENABLED", "false").strip().lower() == "true"
+BETA_ALLOWLIST_USER_IDS = {
+    value.strip()
+    for value in os.getenv("BETA_ALLOWLIST_USER_IDS", "").split(",")
+    if value.strip()
+}
 BROKER_CONNECTIONS_ENABLED = os.getenv("BROKER_CONNECTIONS_ENABLED", "false").strip().lower() == "true"
 BROKER_PAPER_TRADING_ENABLED = os.getenv("BROKER_PAPER_TRADING_ENABLED", "false").strip().lower() == "true"
 BROKER_LIVE_TRADING_ENABLED = os.getenv("BROKER_LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
@@ -80,6 +119,7 @@ _COSTLY_PATHS = {
     "/api/pattern-probabilities",
     "/api/scanners/premade-3pct-scalp",
     "/api/scanners/supernova-radar",
+    "/api/scanners/session-opportunities",
     "/api/market-movers",
     "/api/setup-search",
     "/api/research/analog-search",
@@ -163,6 +203,23 @@ def health_check():
     }
 
 
+@app.get("/api/launch-status")
+def get_launch_status():
+    """Expose safe release-state flags without revealing the beta allowlist."""
+    return {
+        "public_launch_enabled": PUBLIC_LAUNCH_ENABLED,
+        "beta_mode_enabled": BETA_MODE_ENABLED,
+        "release_channel": (
+            "public" if PUBLIC_LAUNCH_ENABLED else "invite_only_beta" if BETA_MODE_ENABLED else "prelaunch"
+        ),
+        "live_session_feed_enabled": SESSION_SCANNER_FEED_ENABLED,
+        "algorithm_versions": {
+            "session_opportunity": SCANNER_ALGORITHM_VERSION,
+            "supernova": SUPERNOVA_ALGORITHM_VERSION,
+        },
+    }
+
+
 @app.head("/", include_in_schema=False)
 @app.head("/health", include_in_schema=False)
 def health_check_head():
@@ -217,6 +274,15 @@ def readiness_check():
         "broker_execution": {
             "live_enabled": BROKER_LIVE_TRADING_ENABLED and not BROKER_GLOBAL_KILL_SWITCH,
             "global_kill_switch": BROKER_GLOBAL_KILL_SWITCH,
+        },
+        "release": {
+            "public_launch_enabled": PUBLIC_LAUNCH_ENABLED,
+            "beta_mode_enabled": BETA_MODE_ENABLED,
+            "live_session_feed_enabled": SESSION_SCANNER_FEED_ENABLED,
+            "algorithm_versions": {
+                "session_opportunity": SCANNER_ALGORITHM_VERSION,
+                "supernova": SUPERNOVA_ALGORITHM_VERSION,
+            },
         },
     }
 
@@ -384,6 +450,18 @@ def require_authenticated_tier(authorization: str | None, required_tier: str) ->
     if not permissions["is_authorized"]:
         raise HTTPException(status_code=403, detail="This feature is not included in your subscription tier")
     return user_id, permissions
+
+
+def require_live_release_access(user_id: str) -> dict:
+    release = beta_access_status(
+        user_id=user_id,
+        public_launch_enabled=PUBLIC_LAUNCH_ENABLED,
+        beta_mode_enabled=BETA_MODE_ENABLED,
+        allowlist=BETA_ALLOWLIST_USER_IDS,
+    )
+    if not release["access_allowed"]:
+        raise HTTPException(status_code=403, detail="This live scanner is currently invite-only")
+    return release
 
 
 class BillingCheckoutInput(BaseModel):
@@ -730,6 +808,37 @@ class SupernovaCandidateInput(BaseModel):
     market_session: str = "regular"
 
 
+class SessionOpportunityInput(BaseModel):
+    ticker: str = Field(min_length=1, max_length=15)
+    asset_type: str = "equity"
+    venue: str | None = Field(default=None, max_length=40)
+    price: float = Field(gt=0, allow_inf_nan=False)
+    relative_volume: float = Field(ge=0, allow_inf_nan=False)
+    average_dollar_volume: float = Field(ge=0, allow_inf_nan=False)
+    spread_bps: float = Field(ge=0, allow_inf_nan=False)
+    price_change_pct: float = Field(allow_inf_nan=False)
+    range_breakout_pct: float = Field(allow_inf_nan=False)
+    vwap_distance_pct: float = Field(allow_inf_nan=False)
+    observed_at: datetime
+    received_at: datetime | None = None
+    market_session: str | None = None
+    provider_supports_session: bool = False
+    broker_supports_session: bool | None = None
+    benchmark_change_pct: float | None = Field(default=None, allow_inf_nan=False)
+    benchmark_above_20d_ma: bool | None = None
+    market_breadth_pct: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    volatility_percentile: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    liquidity_status: str | None = Field(default=None, max_length=20)
+
+
+class MarketRegimeInput(BaseModel):
+    benchmark_change_pct: float | None = Field(default=None, allow_inf_nan=False)
+    benchmark_above_20d_ma: bool | None = None
+    market_breadth_pct: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    volatility_percentile: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    liquidity_status: str | None = Field(default=None, max_length=20)
+
+
 class SupernovaAlertSettingsInput(BaseModel):
     enabled: bool = True
     minimum_score: float = Field(default=65, ge=0, le=100, allow_inf_nan=False)
@@ -910,12 +1019,13 @@ def compare_analog_profiles(reference: dict, candidate: dict) -> dict | None:
 def score_supernova_candidate(candidate: SupernovaCandidateInput) -> dict:
     """Score developing momentum conditions without predicting a future price move."""
     ticker = normalize_ticker(candidate.ticker)
-    session = candidate.market_session.strip().lower()
-    if session not in {"pre_market", "regular", "after_hours"}:
+    try:
+        session = normalize_market_session(candidate.market_session)
+    except ValueError as exc:
         raise HTTPException(
             status_code=422,
-            detail="Market session must be pre_market, regular, or after_hours",
-        )
+            detail="Unsupported market session",
+        ) from exc
 
     quality_failures = []
     if candidate.price < SUPERNOVA_PRESET["minimum_price"]:
@@ -987,10 +1097,15 @@ def score_supernova_candidate(candidate: SupernovaCandidateInput) -> dict:
         "alert_eligible": stage in {"TRIGGERED", "CONFIRMED_MOMENTUM"},
         "quality_failures": quality_failures,
         "components": {key: round(value, 1) for key, value in components.items()},
-        "metrics": candidate.model_dump(exclude={"ticker"}),
+        "metrics": {
+            **candidate.model_dump(exclude={"ticker", "market_session"}),
+            "market_session": session,
+        },
         "time_adjusted_volume_required": True,
         "follow_through_required_for_confirmation": True,
         "prediction_claimed": False,
+        "algorithm_version": SUPERNOVA_ALGORITHM_VERSION,
+        "market_regime": "insufficient_data",
         "calibration_status": "provisional_until_paid_feed_backtest",
         "message": f"{ticker} has {stage.lower().replace('_', ' ')} Supernova conditions; this is not a price prediction.",
     }
@@ -1117,6 +1232,247 @@ def calculate_supernova_score(
     }
 
 
+def score_session_opportunity(
+    candidate: SessionOpportunityInput,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Rank supplied metrics while keeping tradability claims provider-dependent."""
+    try:
+        observed_utc = require_aware_utc(candidate.observed_at, "observed_at")
+        received_utc = (
+            require_aware_utc(candidate.received_at, "received_at")
+            if candidate.received_at
+            else None
+        )
+        if received_utc and received_utc < observed_utc - timedelta(seconds=30):
+            raise ValueError("received_at cannot materially precede observed_at")
+        asset_type = normalize_asset_type(candidate.asset_type)
+        reported_session = (
+            normalize_market_session(candidate.market_session)
+            if candidate.market_session
+            else None
+        )
+        availability = assess_market_availability(
+            observed_at=candidate.observed_at,
+            now=now or datetime.now(timezone.utc),
+            asset_type=asset_type,
+            reported_session=reported_session,
+            provider_supports_session=candidate.provider_supports_session,
+            broker_supports_session=candidate.broker_supports_session,
+            max_fresh_age_seconds=SESSION_SCANNER_CACHE_MAX_AGE_SECONDS,
+        )
+        ranking = rank_session_candidate(
+            relative_volume=candidate.relative_volume,
+            average_dollar_volume=candidate.average_dollar_volume,
+            spread_bps=candidate.spread_bps,
+            price_change_pct=candidate.price_change_pct,
+            range_breakout_pct=candidate.range_breakout_pct,
+            vwap_distance_pct=candidate.vwap_distance_pct,
+        )
+        regime = classify_market_regime(
+            benchmark_change_pct=candidate.benchmark_change_pct,
+            benchmark_above_20d_ma=candidate.benchmark_above_20d_ma,
+            market_breadth_pct=candidate.market_breadth_pct,
+            volatility_percentile=candidate.volatility_percentile,
+            liquidity_status=candidate.liquidity_status,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    eligibility_reasons = []
+    if ranking["ranking_score"] < 40:
+        eligibility_reasons.append("ranking_score_below_watch_threshold")
+    if availability["data_status"] != "fresh":
+        eligibility_reasons.append("data_not_fresh")
+    if availability["market_session"] == "closed":
+        eligibility_reasons.append("market_closed")
+    if not availability["provider_supports_session"]:
+        eligibility_reasons.append("provider_session_unconfirmed")
+    return {
+        "ticker": normalize_ticker(candidate.ticker),
+        "asset_type": asset_type,
+        "venue": candidate.venue,
+        "price": candidate.price,
+        **availability,
+        **ranking,
+        **regime,
+        "algorithm_version": SCANNER_ALGORITHM_VERSION,
+        "scanner_eligible": not eligibility_reasons,
+        "eligibility_reasons": list(dict.fromkeys(eligibility_reasons)),
+        "observed_at": candidate.observed_at,
+        "received_at": candidate.received_at,
+        "educational_analysis_only": True,
+        "trade_execution_available": False,
+    }
+
+
+@app.post("/api/tools/market-regime")
+def calculate_market_regime(
+    observations: MarketRegimeInput,
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Classify caller-supplied market-wide conditions using versioned rules."""
+    _user_id, permissions = require_authenticated_tier(authorization, "premium_scanner")
+    try:
+        regime = classify_market_regime(**observations.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        **regime,
+        "algorithm_version": SCANNER_ALGORITHM_VERSION,
+        "tier": permissions["tier"],
+        "input_source": "caller_supplied_market_observations",
+    }
+
+
+@app.get("/api/accuracy/claim-readiness")
+def get_claim_readiness(
+    successes: int = Query(ge=0),
+    total: int = Query(ge=0),
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Report whether an observed win rate has enough examples to be displayed."""
+    _user_id, permissions = require_authenticated_tier(authorization, "premium_scanner")
+    try:
+        claim = statistical_claim_status(
+            successes=successes,
+            total=total,
+            minimum_sample_size=MINIMUM_WIN_RATE_SAMPLE_SIZE,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        **claim,
+        "confidence_interval_95": (
+            wilson_confidence_interval(successes, total)
+            if claim["win_rate_display_allowed"]
+            else None
+        ),
+        "tier": permissions["tier"],
+        "metric_type": "historical_observed_rate",
+    }
+
+
+@app.post("/api/tools/session-opportunity-score")
+def calculate_session_opportunity_score(
+    candidate: SessionOpportunityInput,
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Explain a paid user's caller-supplied session candidate without a live claim."""
+    _user_id, permissions = require_authenticated_tier(authorization, "premium_scanner")
+    return {
+        **score_session_opportunity(candidate),
+        "tier": permissions["tier"],
+        "input_source": "caller_supplied_metrics",
+    }
+
+
+@app.get("/api/scanners/session-opportunities")
+def get_session_opportunities(
+    asset_type: str | None = Query(default=None, max_length=20),
+    market_session: str | None = Query(default=None, max_length=30),
+    weekend_only: bool = False,
+    minimum_score: float = Query(default=40, ge=0, le=100),
+    include_unconfirmed: bool = False,
+    limit: int = Query(default=10, ge=1, le=50),
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Return fresh provider observations with explicit session and freshness labels."""
+    user_id, permissions = require_authenticated_tier(authorization, "premium_scanner")
+    normalized_asset = None
+    normalized_session = None
+    try:
+        if asset_type:
+            normalized_asset = normalize_asset_type(asset_type)
+        if market_session:
+            normalized_session = normalize_market_session(market_session)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    base = {
+        "scanner": {
+            "preset_key": "floatiq_session_opportunities_v1",
+            "display_name": "FloatIQ Session Opportunities",
+            "weekend_capable": True,
+            "algorithm_version": SCANNER_ALGORITHM_VERSION,
+        },
+        "tier": permissions["tier"],
+        "filters": {
+            "asset_type": normalized_asset,
+            "market_session": normalized_session,
+            "weekend_only": weekend_only,
+            "minimum_score": minimum_score,
+            "include_unconfirmed": include_unconfirmed,
+        },
+        "tradability_disclaimer": (
+            "Potentially tradable requires fresh provider data and broker-session support; "
+            "chart availability alone is not trading availability."
+        ),
+    }
+    if not SESSION_SCANNER_FEED_ENABLED:
+        return {**base, "data_status": "awaiting_live_feed", "candidates": []}
+    require_live_release_access(user_id)
+    if supabase is None:
+        raise HTTPException(status_code=503, detail="Session scanner cache is not configured")
+    try:
+        response = (
+            supabase.table("session_opportunity_cache")
+            .select("*")
+            .order("ranking_score", desc=True)
+            .limit(200)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Session Opportunity scanner lookup failed")
+        raise HTTPException(status_code=502, detail="Session scanner is temporarily unavailable")
+
+    now = datetime.now(timezone.utc)
+    feed_health = assess_feed_batch(
+        response.data or [],
+        now=now,
+        max_age_seconds=SESSION_SCANNER_CACHE_MAX_AGE_SECONDS,
+    )
+    if feed_health["publication_halted"]:
+        logger.warning(json.dumps({"event": "session_feed_halted", **feed_health}, separators=(",", ":")))
+        return {
+            **base,
+            "data_status": "feed_halted",
+            "data_quality": feed_health,
+            "candidates": [],
+        }
+    candidates = []
+    for row in response.data or []:
+        try:
+            candidate = SessionOpportunityInput(**{
+                key: value
+                for key, value in row.items()
+                if key in SessionOpportunityInput.model_fields
+            })
+            scored = score_session_opportunity(candidate, now=now)
+        except (HTTPException, TypeError, ValueError):
+            continue
+        if normalized_asset and scored["asset_type"] != normalized_asset:
+            continue
+        if normalized_session and scored["market_session"] != normalized_session:
+            continue
+        if weekend_only and not scored["is_weekend"]:
+            continue
+        if scored["ranking_score"] < minimum_score:
+            continue
+        if not include_unconfirmed and not scored["scanner_eligible"]:
+            continue
+        candidates.append(scored)
+        if len(candidates) >= min(limit, permissions["pattern_result_limit"]):
+            break
+    return {
+        **base,
+        "data_status": "live" if candidates else "live_no_matching_candidates",
+        "data_quality": feed_health,
+        "candidates": candidates,
+    }
+
+
 def load_supernova_alert_settings(user_id: str) -> dict:
     if supabase is None:
         raise HTTPException(status_code=503, detail="Supernova settings database is not configured")
@@ -1185,6 +1541,7 @@ def get_supernova_radar(
         "included_with_subscription": True,
         "custom_thresholds_available": permissions["custom_supernova_thresholds"],
         "prediction_claimed": False,
+        "algorithm_version": SUPERNOVA_ALGORITHM_VERSION,
     }
     if not SUPERNOVA_FEED_ENABLED:
         return {
@@ -1192,6 +1549,7 @@ def get_supernova_radar(
             "data_status": "awaiting_live_feed",
             "candidates": [],
         }
+    require_live_release_access(user_id)
     if supabase is None:
         raise HTTPException(status_code=503, detail="Supernova cache is not configured")
     try:
@@ -1207,6 +1565,22 @@ def get_supernova_radar(
         raise HTTPException(status_code=502, detail="Supernova Radar is temporarily unavailable")
 
     now = datetime.now(timezone.utc)
+    feed_health = assess_feed_batch(
+        [
+            {**row, "observed_at": row.get("updated_at")}
+            for row in (response.data or [])
+        ],
+        now=now,
+        max_age_seconds=SUPERNOVA_CACHE_MAX_AGE_SECONDS,
+    )
+    if feed_health["publication_halted"]:
+        logger.warning(json.dumps({"event": "supernova_feed_halted", **feed_health}, separators=(",", ":")))
+        return {
+            **base,
+            "data_status": "feed_halted",
+            "data_quality": feed_health,
+            "candidates": [],
+        }
     alert_settings = (
         load_supernova_alert_settings(user_id)
         if permissions["custom_supernova_thresholds"]
@@ -1232,6 +1606,7 @@ def get_supernova_radar(
     return {
         **base,
         "data_status": "live" if candidates else "live_no_fresh_candidates",
+        "data_quality": feed_health,
         "active_alert_filters": alert_settings,
         "candidates": candidates,
     }
@@ -1875,9 +2250,14 @@ def get_probabilities(
 
             successes = int(group["outcome"].sum())
             win_rate = round((successes / total) * 100, 2)
+            claim_status = statistical_claim_status(
+                successes=successes,
+                total=total,
+                minimum_sample_size=MINIMUM_WIN_RATE_SAMPLE_SIZE,
+            )
             recent_group = group[group["trade_date"] >= thirty_days_ago]
             recent_win_rate = None
-            if len(recent_group) >= 2:
+            if len(recent_group) >= MINIMUM_WIN_RATE_SAMPLE_SIZE:
                 recent_win_rate = round((recent_group["outcome"].sum() / len(recent_group)) * 100, 2)
 
             confluence_score = 1
@@ -1910,15 +2290,27 @@ def get_probabilities(
             formatted_patterns.append({
                 "pattern_key": re.sub(r"[^a-z0-9]+", "-", f"{p_name}-{g_type}".lower()).strip("-"),
                 "pattern_headline": f"{p_name} ({g_type})",
-                "overall_probability_win_rate": f"{win_rate}%",
-                "historical_win_rate_pct": win_rate,
-                "confidence_interval_95": wilson_confidence_interval(successes, total),
+                "overall_probability_win_rate": (
+                    f"{win_rate}%" if claim_status["win_rate_display_allowed"] else None
+                ),
+                "historical_win_rate_pct": (
+                    win_rate if claim_status["win_rate_display_allowed"] else None
+                ),
+                "confidence_interval_95": (
+                    wilson_confidence_interval(successes, total)
+                    if claim_status["win_rate_display_allowed"]
+                    else None
+                ),
                 "thirty_day_recent_probability": f"{recent_win_rate}%" if recent_win_rate is not None else None,
                 "recent_sample_size_count": len(recent_group),
                 "sample_quality": "low" if total < 20 else "moderate" if total < 50 else "higher",
-                "small_sample_warning": total < 20,
+                "small_sample_warning": not claim_status["win_rate_display_allowed"],
+                "minimum_sample_size_required": MINIMUM_WIN_RATE_SAMPLE_SIZE,
+                "win_rate_display_allowed": claim_status["win_rate_display_allowed"],
+                "statistical_claim_status": claim_status["statistical_claim_status"],
                 "confluence_factor_rating": f"{confluence_score}/4",
                 "sample_size_count": total,
+                "algorithm_version": SCANNER_ALGORITHM_VERSION,
                 "average_target_payout": f"${avg_dollar} ({avg_gain}%)",
                 "historical_adverse_drawdown": f"{avg_dd}%",
                 "mathematical_expectancy_score": expectancy,
@@ -1959,6 +2351,9 @@ def get_probabilities(
                 else f"gap fill to prior close within {lookahead_candles} daily candles"
             ),
             "metric_type": "historical_observed_rate",
+            "algorithm_version": SCANNER_ALGORITHM_VERSION,
+            "market_regime": "insufficient_data",
+            "market_regime_note": "A market-wide regime requires benchmark, breadth, volatility, and liquidity inputs.",
             "data_status": "available",
             "patterns": formatted_patterns,
         }

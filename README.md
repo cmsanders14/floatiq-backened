@@ -61,6 +61,14 @@ Copy `.env.example` to `.env` for local development. Configure the same values i
 - `TRUST_PROXY_HEADERS`: Set only when the deployment proxy sanitizes `X-Forwarded-For`.
 - `SUPERNOVA_FEED_ENABLED`: Keep `false` until the paid live-feed worker is populating fresh candidates.
 - `SUPERNOVA_CACHE_MAX_AGE_SECONDS`: Reject cached Supernova candidates older than this; default `120`.
+- `SESSION_SCANNER_FEED_ENABLED`: Keep `false` until feed calibration and circuit-breaker tests pass.
+- `SESSION_SCANNER_CACHE_MAX_AGE_SECONDS`: Maximum fresh age for session observations; default `120`.
+- `SCANNER_ALGORITHM_VERSION`: Immutable version label attached to every scored observation.
+- `SUPERNOVA_ALGORITHM_VERSION`: Immutable version label attached to Supernova observations.
+- `MINIMUM_WIN_RATE_SAMPLE_SIZE`: Evidence floor before a win rate is displayed; minimum/default `30`.
+- `BETA_MODE_ENABLED`: Restricts the live session scanner to invited user IDs when `true`.
+- `PUBLIC_LAUNCH_ENABLED`: Keep `false` throughout invite-only forward testing.
+- `BETA_ALLOWLIST_USER_IDS`: Comma-separated Supabase user UUIDs; never returned by the API.
 - `BILLING_ENABLED`: Keep `false` until Stripe test-mode checkout and webhooks pass end to end.
 - `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`: Server-only Stripe credentials.
 - `STRIPE_PRICE_PRO` / `STRIPE_PRICE_ELITE`: Server-owned recurring Price IDs; the client never supplies one.
@@ -134,6 +142,9 @@ claiming that no chart patterns exist.
 ### Other endpoints
 
 - `GET /api/subscription-entitlements`
+- `GET /api/launch-status` (safe beta/public/feed/version flags; never returns the allowlist)
+- `GET /api/accuracy/claim-readiness` (paid; enforces the minimum evidence floor)
+- `POST /api/tools/market-regime` (paid; versioned deterministic regime classification)
 - `GET /api/billing/status` (effective tier and safe activation flags)
 - `POST /api/billing/checkout-session` (authenticated; disabled until Stripe is configured)
 - `POST /api/billing/customer-portal` (authenticated; hosted account management)
@@ -147,6 +158,8 @@ claiming that no chart patterns exist.
 - `GET /api/scanners/premade-3pct-scalp`
 - `GET /api/scanners/supernova-radar` (default Pro/Elite preset; returns no simulated candidates)
 - `POST /api/tools/supernova-score` (transparent Pro/Elite scoring for supplied metrics)
+- `GET /api/scanners/session-opportunities` (session/freshness-aware paid scanner; live feed disabled by default)
+- `POST /api/tools/session-opportunity-score` (transparent scoring for caller-supplied session metrics)
 - `GET /api/scanners/supernova-settings` (Elite saved alert thresholds)
 - `PUT /api/scanners/supernova-settings` (Elite saved alert thresholds)
 - `GET /api/calculate-position`
@@ -217,6 +230,23 @@ project, remove direct Data API access to backend-owned tables, and clean up red
 Run `migrations/010_billing_and_notification_delivery.sql` after migration 009. It adds a minimal
 Stripe webhook audit ledger plus per-user notification events and retryable channel deliveries.
 All three tables are service-only and have RLS enabled with no client policy.
+
+Run `migrations/011_session_aware_scanner.sql` after migration 010. It adds service-only
+instrument-session capabilities, fresh opportunity observations, and saved scanner presets. Keep
+`SESSION_SCANNER_FEED_ENABLED=false` until a licensed feed supplies explicit timestamps and
+session coverage. The API reports chartability, freshness, and broker-dependent tradability as
+separate fields so a stale or merely chartable quote is never labeled tradable.
+
+Run `migrations/012_accuracy_ledger_and_launch_controls.sql` after migration 011. It adds
+append-only algorithm versions, market-regime snapshots, scanner-signal events, and outcome
+observations. Application access is limited to service-role `SELECT` and `INSERT`, so old evidence
+cannot be edited or deleted by the API. Each correction must be a new versioned observation.
+Run `migrations/013_accuracy_ledger_index_cleanup.sql` afterward to cover correction-lineage
+lookups and foreign-key maintenance efficiently.
+
+Win rates remain hidden until `MINIMUM_WIN_RATE_SAMPLE_SIZE` qualifying examples exist. The API
+still returns sample size and `statistical_claim_status=insufficient_sample`, allowing FlutterFlow
+to explain why the percentage is unavailable without presenting an unstable statistic.
 
 ## Billing safety contract
 
