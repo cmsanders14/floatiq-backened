@@ -16,7 +16,7 @@ load_dotenv()
 
 from fastapi import FastAPI, Query, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
@@ -163,14 +163,37 @@ def health_check():
     }
 
 
+@app.head("/", include_in_schema=False)
+@app.head("/health", include_in_schema=False)
+def health_check_head():
+    """Accept lightweight platform and uptime probes without a response body."""
+    return Response(status_code=200)
+
+
+def database_connection_ready() -> bool:
+    """Run a bounded read so readiness reflects connectivity, not only configuration."""
+    if supabase is None:
+        return False
+    try:
+        supabase.table("pattern_metadata").select("id").limit(1).execute()
+        return True
+    except Exception:
+        logger.warning(json.dumps({"event": "database_readiness_failed"}))
+        return False
+
+
 @app.get("/ready")
 def readiness_check():
     """Report activation state without exposing credentials or provider identifiers."""
-    database_ready = supabase is not None
+    database_configured = supabase is not None
+    database_ready = database_connection_ready()
     return {
         "status": "ready" if database_ready else "degraded",
         "service": "FloatIQ Analytics Engine",
-        "database": {"configured": database_ready},
+        "database": {
+            "configured": database_configured,
+            "reachable": database_ready,
+        },
         "billing": {
             "enabled": BILLING_CONFIG.enabled,
             "checkout_configured": all((
