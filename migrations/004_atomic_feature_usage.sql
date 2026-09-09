@@ -11,7 +11,7 @@ create or replace function public.claim_daily_feature_selection(
 returns boolean
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $$
 declare
     claimed_key text;
@@ -49,4 +49,3 @@ revoke all on function public.claim_daily_feature_selection(uuid, date, text, te
     from public, anon, authenticated;
 grant execute on function public.claim_daily_feature_selection(uuid, date, text, text, text)
     to service_role;
-

@@ -21,8 +21,6 @@ begin
 end;
 $$;
 
-create index if not exists user_subscriptions_user_created_idx
-    on public.user_subscriptions (user_id, created_at desc);
 create unique index if not exists user_subscriptions_provider_id_idx
     on public.user_subscriptions (provider_subscription_id)
     where provider_subscription_id is not null;
@@ -30,7 +28,7 @@ create unique index if not exists user_subscriptions_provider_id_idx
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
-set search_path = public
+set search_path = ''
 as $$
 begin
     new.updated_at = now();
@@ -62,4 +60,3 @@ drop trigger if exists set_user_discipline_settings_updated_at on public.user_di
 create trigger set_user_discipline_settings_updated_at
 before update on public.user_discipline_settings
 for each row execute function public.set_updated_at();
-
