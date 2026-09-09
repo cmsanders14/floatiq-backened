@@ -2,7 +2,7 @@
 
 ## Global API setup
 
-- Base URL: `https://floatiq-backened.onrender.com`
+- Base URL: `https://api.floatiqanalytics.com`
 - Content type for POST/PUT calls: `application/json`
 - Signed-in calls: `Authorization: Bearer <current Supabase access token>`
 - Never send or store `SUPABASE_SERVICE_KEY` in FlutterFlow.
