@@ -236,6 +236,28 @@ def test_readiness_and_security_headers_do_not_expose_secrets():
     assert "whsec" not in body
 
 
+def test_readiness_performs_a_bounded_database_read():
+    database = StatefulSupabase({"pattern_metadata": [{"id": "pattern-1"}]})
+    with patch.object(floatiq, "supabase", database):
+        response = client.get("/ready")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+    assert response.json()["database"] == {"configured": True, "reachable": True}
+
+
+def test_readiness_degrades_without_exposing_database_errors():
+    class UnreachableSupabase:
+        def table(self, _name):
+            raise RuntimeError("sensitive provider detail")
+
+    with patch.object(floatiq, "supabase", UnreachableSupabase()):
+        response = client.get("/ready")
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert response.json()["database"] == {"configured": True, "reachable": False}
+    assert "sensitive provider detail" not in response.text
+
+
 def test_checkout_endpoint_is_inactive_without_configuration():
     with patch.object(floatiq, "get_authenticated_user_id", return_value="user-1"):
         response = client.post(
