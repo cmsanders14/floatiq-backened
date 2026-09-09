@@ -98,6 +98,11 @@ class FloatIQTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
 
+    def test_http_health_accepts_head_probes(self):
+        response = client.head("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"")
+
     def test_http_private_route_is_protected(self):
         response = client.get("/api/user-journal-summary")
         self.assertEqual(response.status_code, 401)
