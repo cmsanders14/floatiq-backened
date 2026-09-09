@@ -1,0 +1,40 @@
+name: Backend CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Reject committed Supabase secret keys
+        shell: bash
+        run: |
+          if git grep -n -E 'sb_sec[r]et_[A-Za-z0-9_-]+' -- ':!demo/**'; then
+            echo 'A Supabase secret key is committed to the repository.' >&2
+            exit 1
+          fi
+
+      - name: Compile Python sources
+        run: python -m compileall -q .
+
+      - name: Run test suite
+        run: python -m pytest -q
