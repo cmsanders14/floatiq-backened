@@ -23,6 +23,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--requests", type=int, default=12)
+    parser.add_argument(
+        "--require-database",
+        action="store_true",
+        help="Fail when the readiness probe cannot complete its bounded database read.",
+    )
     args = parser.parse_args()
     request_count = min(50, max(1, args.requests))
     failures = []
@@ -37,6 +42,12 @@ def main() -> int:
             serialized = json.dumps(body).lower()
             if any(prefix in serialized for prefix in ("sk_live_", "whsec_", "sb_secret_")):
                 failures.append(f"{path} appears to expose a secret-named field")
+            if (
+                path == "/ready"
+                and args.require_database
+                and not body.get("database", {}).get("reachable", False)
+            ):
+                failures.append("/ready reports that the database is not reachable")
 
         with ThreadPoolExecutor(max_workers=min(8, request_count)) as pool:
             results = list(pool.map(lambda _index: fetch(args.base_url, "/health"), range(request_count)))
