@@ -19,6 +19,10 @@
 5. `004_atomic_feature_usage.sql`
 6. `005_subscription_lifecycle_and_timestamps.sql`
 7. `006_supernova_radar.sql`
+8. `007_broker_integration_foundation.sql`
+9. `008_reconcile_legacy_schema_and_lock_down_data_api.sql`
+10. `009_advisor_performance_cleanup.sql`
+11. `010_billing_and_notification_delivery.sql`
 
 ## Pricing and dashboard limits
 
@@ -38,6 +42,30 @@ Use:
 - `$.current_entitlements.discipline_level`
 
 FlutterFlow may hide locked controls for convenience, but FastAPI remains the security boundary.
+
+## Billing
+
+Call `GET /api/billing/status` after login and after returning from hosted checkout. Bind
+`$.tier`, `$.subscription_status`, `$.checkout_enabled`, and `$.customer_portal_enabled`.
+
+To upgrade, send only `{"tier":"premium_scanner"}` or
+`{"tier":"autonomous_bot"}` to `POST /api/billing/checkout-session`, then open
+`$.checkout_url`. Never add a Price ID or claimed payment status to the FlutterFlow request.
+Returning from Stripe is not proof of payment: refresh billing status until the signed webhook
+updates the entitlement. Open `$.portal_url` returned by `POST /api/billing/customer-portal` for
+cancellation and payment-method management.
+
+If checkout returns `503`, show "Billing is not available yet" and leave the current tier intact.
+
+## Notification inbox
+
+Call `GET /api/notifications?unread_only=false&limit=50`. Bind the list to `$.notifications` and
+show `event_type`, `title`, `message`, `payload`, `created_at`, and the `read_at` state. Mark a row
+read with `POST /api/notifications/<id>/read`; do not send a user ID. A `404` means the record does
+not exist for that signed-in account.
+
+In-app notifications require no device-provider key. Push and web-push switches should remain
+hidden until the backend reports a configured delivery provider in a future contract.
 
 ## Pattern search
 

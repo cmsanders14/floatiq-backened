@@ -38,6 +38,8 @@ uvicorn main:app --reload
 
 Health check: `GET /health`
 
+Readiness/activation check: `GET /ready` (returns booleans only; never credential values)
+
 ## Environment variables
 
 Copy `.env.example` to `.env` for local development. Configure the same values in Render:
@@ -54,6 +56,11 @@ Copy `.env.example` to `.env` for local development. Configure the same values i
 - `TRUST_PROXY_HEADERS`: Set only when the deployment proxy sanitizes `X-Forwarded-For`.
 - `SUPERNOVA_FEED_ENABLED`: Keep `false` until the paid live-feed worker is populating fresh candidates.
 - `SUPERNOVA_CACHE_MAX_AGE_SECONDS`: Reject cached Supernova candidates older than this; default `120`.
+- `BILLING_ENABLED`: Keep `false` until Stripe test-mode checkout and webhooks pass end to end.
+- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`: Server-only Stripe credentials.
+- `STRIPE_PRICE_PRO` / `STRIPE_PRICE_ELITE`: Server-owned recurring Price IDs; the client never supplies one.
+- `BILLING_SUCCESS_URL`, `BILLING_CANCEL_URL`, `BILLING_PORTAL_RETURN_URL`: HTTPS app destinations.
+- `ENABLE_HSTS`: Enable only after every public hostname is permanently HTTPS.
 
 Recommended Render commands:
 
@@ -114,6 +121,12 @@ claiming that no chart patterns exist.
 ### Other endpoints
 
 - `GET /api/subscription-entitlements`
+- `GET /api/billing/status` (effective tier and safe activation flags)
+- `POST /api/billing/checkout-session` (authenticated; disabled until Stripe is configured)
+- `POST /api/billing/customer-portal` (authenticated; hosted account management)
+- `POST /api/billing/stripe/webhook` (Stripe only; signed raw body, no user authentication)
+- `GET /api/notifications` (authenticated in-app inbox)
+- `POST /api/notifications/{notification_id}/read` (ownership checked by verified token)
 - `GET /api/setup-search`
 - `POST /api/tools/large-trade-score` (Pro or Elite; provisional scoring pending live-feed calibration)
 - `GET /api/tools/compounding-scenario` (educational paper-challenge math)
@@ -184,6 +197,33 @@ connection references, idempotent order intents, and an append-only order-event 
 does not store broker tokens and does not enable live submission. Read
 `BROKER_INTEGRATION_READINESS.md` before beginning any provider application or OAuth work.
 
+Run `migrations/008_reconcile_legacy_schema_and_lock_down_data_api.sql` and
+`migrations/009_advisor_performance_cleanup.sql` after migration 007. They reconcile the legacy
+project, remove direct Data API access to backend-owned tables, and clean up redundant indexes.
+
+Run `migrations/010_billing_and_notification_delivery.sql` after migration 009. It adds a minimal
+Stripe webhook audit ledger plus per-user notification events and retryable channel deliveries.
+All three tables are service-only and have RLS enabled with no client policy.
+
+## Billing safety contract
+
+- Checkout accepts only the canonical tier name; the server selects the Stripe Price ID.
+- A plan changes only after a valid, timestamped Stripe webhook signature is verified.
+- Webhook event IDs are stored uniquely, making normal Stripe retries idempotent.
+- Because Stripe does not guarantee event order, each accepted event triggers a server-side read
+  of the subscription's current state before any entitlement is changed.
+- Unknown prices, missing user metadata, stale signatures, and unconfigured billing fail closed.
+- Failed or canceled subscriptions fall back to Free through the existing entitlement check.
+- Run Stripe CLI test-mode events before setting `BILLING_ENABLED=true`; never test with live cards.
+
+## Notification delivery contract
+
+The `notifications` row is the authenticated in-app inbox record. Each requested channel has one
+`notification_deliveries` row with `pending`, `processing`, `delivered`, `failed`, or
+`dead_letter` state. In-app delivery is immediately available; push, web push, and email remain
+pending until a provider adapter and credential are explicitly enabled. Retry delays are bounded
+and no provider failure can silently relabel a message delivered.
+
 The ingestion worker is also dry-run by default:
 
 ```bash
@@ -228,3 +268,14 @@ data feed should replace it before production-scale scanning.
 
 Pattern percentages are historical estimates based on the available sample and should not be
 presented as guaranteed outcomes or standalone buy/sell signals.
+
+## Safe launch probe
+
+With the server running, perform a small read-only concurrency check:
+
+```bash
+python scripts/launch_smoke.py --base-url http://127.0.0.1:8000 --requests 20
+```
+
+The probe checks health, readiness, OpenAPI, security headers, and a bounded burst. It never signs
+in, mutates data, or calls a market-data endpoint.

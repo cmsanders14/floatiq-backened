@@ -1,7 +1,10 @@
 import logging
+import json
 import math
 import os
 import re
+import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
 import pandas as pd
@@ -18,6 +21,14 @@ from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
 from floatiq_core.entitlements import TIER_CONFIG, TIER_WEIGHTS, tier_entitlements
+from floatiq_core.billing import (
+    BillingConfig,
+    BillingConfigurationError,
+    WebhookSignatureError,
+    event_is_newer,
+    subscription_row_from_stripe,
+    verify_stripe_signature,
+)
 from floatiq_core.brokers import (
     BrokerIntegrationError,
     broker_capability_manifest,
@@ -26,8 +37,15 @@ from floatiq_core.brokers import (
     validate_idempotency_key,
 )
 from floatiq_core.market_data import _MARKET_DATA_CACHE, download_market_data
+from floatiq_core.notifications import delivery_rows, notification_event_row, normalize_channels
 from floatiq_core.rate_limit import SlidingWindowRateLimiter
 logger = logging.getLogger("floatiq")
+logger.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_log_handler)
+logger.propagate = False
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wupivkrdqgrzogdaoueu.supabase.co")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
@@ -47,6 +65,8 @@ BROKER_CONNECTIONS_ENABLED = os.getenv("BROKER_CONNECTIONS_ENABLED", "false").st
 BROKER_PAPER_TRADING_ENABLED = os.getenv("BROKER_PAPER_TRADING_ENABLED", "false").strip().lower() == "true"
 BROKER_LIVE_TRADING_ENABLED = os.getenv("BROKER_LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
 BROKER_GLOBAL_KILL_SWITCH = os.getenv("BROKER_GLOBAL_KILL_SWITCH", "true").strip().lower() == "true"
+BILLING_CONFIG = BillingConfig.from_env()
+ENABLE_HSTS = os.getenv("ENABLE_HSTS", "false").strip().lower() == "true"
 
 
 app = FastAPI(title="FloatIQ Analytics Engine", version="3.0.0")
@@ -64,6 +84,36 @@ _COSTLY_PATHS = {
     "/api/setup-search",
     "/api/research/analog-search",
 }
+
+
+@app.middleware("http")
+async def add_request_context_and_security_headers(request: Request, call_next):
+    """Attach a traceable request ID, safe browser headers, and one structured log."""
+    request_id = request.headers.get("x-request-id", "").strip()[:100] or str(uuid.uuid4())
+    started = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        status_code = response.status_code if response is not None else 500
+        logger.info(json.dumps({
+            "event": "http_request",
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": status_code,
+            "duration_ms": elapsed_ms,
+        }, separators=(",", ":")))
+        if response is not None:
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+            if ENABLE_HSTS:
+                response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
 
 @app.middleware("http")
@@ -110,6 +160,41 @@ def health_check():
         "service": "FloatIQ Analytics Engine",
         "version": app.version,
         "database_configured": supabase is not None,
+    }
+
+
+@app.get("/ready")
+def readiness_check():
+    """Report activation state without exposing credentials or provider identifiers."""
+    database_ready = supabase is not None
+    return {
+        "status": "ready" if database_ready else "degraded",
+        "service": "FloatIQ Analytics Engine",
+        "database": {"configured": database_ready},
+        "billing": {
+            "enabled": BILLING_CONFIG.enabled,
+            "checkout_configured": all((
+                BILLING_CONFIG.enabled,
+                BILLING_CONFIG.secret_key,
+                BILLING_CONFIG.pro_price_id,
+                BILLING_CONFIG.elite_price_id,
+                BILLING_CONFIG.success_url,
+                BILLING_CONFIG.cancel_url,
+            )),
+            "webhook_configured": bool(
+                BILLING_CONFIG.enabled
+                and BILLING_CONFIG.webhook_secret
+                and BILLING_CONFIG.secret_key
+            ),
+        },
+        "notifications": {
+            "in_app_ready": database_ready,
+            "external_delivery_enabled": False,
+        },
+        "broker_execution": {
+            "live_enabled": BROKER_LIVE_TRADING_ENABLED and not BROKER_GLOBAL_KILL_SWITCH,
+            "global_kill_switch": BROKER_GLOBAL_KILL_SWITCH,
+        },
     }
 
 
@@ -276,6 +361,288 @@ def require_authenticated_tier(authorization: str | None, required_tier: str) ->
     if not permissions["is_authorized"]:
         raise HTTPException(status_code=403, detail="This feature is not included in your subscription tier")
     return user_id, permissions
+
+
+class BillingCheckoutInput(BaseModel):
+    tier: str = Field(pattern=r"^(premium_scanner|autonomous_bot)$")
+
+
+def _load_stripe_module():
+    try:
+        import stripe
+    except ImportError as exc:
+        raise BillingConfigurationError("Stripe support is not installed") from exc
+    stripe.api_key = BILLING_CONFIG.secret_key
+    return stripe
+
+
+@app.get("/api/billing/status")
+def get_billing_status(
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Return effective access and safe billing activation flags for the signed-in user."""
+    user_id = get_authenticated_user_id(authorization)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    permissions = check_user_tier_permissions(user_id, "free")
+    return {
+        "tier": permissions["tier"],
+        "subscription_status": permissions["subscription_status"],
+        "checkout_enabled": BILLING_CONFIG.enabled,
+        "customer_portal_enabled": bool(
+            BILLING_CONFIG.enabled
+            and BILLING_CONFIG.secret_key
+            and BILLING_CONFIG.portal_return_url
+        ),
+    }
+
+
+@app.post("/api/billing/checkout-session")
+def create_billing_checkout_session(
+    checkout: BillingCheckoutInput,
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Create a hosted Stripe subscription checkout using server-owned price IDs."""
+    user_id = get_authenticated_user_id(authorization)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        BILLING_CONFIG.require_checkout()
+        price_id = BILLING_CONFIG.price_for_tier(checkout.tier)
+        stripe = _load_stripe_module()
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=BILLING_CONFIG.success_url,
+            cancel_url=BILLING_CONFIG.cancel_url,
+            client_reference_id=user_id,
+            metadata={"user_id": user_id, "requested_tier": checkout.tier},
+            subscription_data={"metadata": {"user_id": user_id}},
+        )
+        return {"checkout_url": session.url, "session_id": session.id}
+    except BillingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception:
+        logger.exception("Stripe checkout creation failed for %s", user_id)
+        raise HTTPException(status_code=502, detail="Billing checkout is temporarily unavailable")
+
+
+@app.post("/api/billing/customer-portal")
+def create_billing_portal_session(
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Create a hosted Stripe customer-portal session without exposing customer IDs."""
+    user_id = get_authenticated_user_id(authorization)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not (
+        BILLING_CONFIG.enabled
+        and BILLING_CONFIG.secret_key
+        and BILLING_CONFIG.portal_return_url
+    ):
+        raise HTTPException(status_code=503, detail="The billing portal is not configured")
+    try:
+        subscription = (
+            supabase.table("user_subscriptions")
+            .select("provider_customer_id")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        customer_id = (
+            subscription.data[0].get("provider_customer_id")
+            if subscription.data else None
+        )
+        if not customer_id:
+            raise HTTPException(status_code=404, detail="No billing customer is associated with this account")
+        stripe = _load_stripe_module()
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=BILLING_CONFIG.portal_return_url,
+        )
+        return {"portal_url": session.url}
+    except HTTPException:
+        raise
+    except BillingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception:
+        logger.exception("Stripe portal creation failed for %s", user_id)
+        raise HTTPException(status_code=502, detail="The billing portal is temporarily unavailable")
+
+
+@app.post("/api/billing/stripe/webhook")
+async def receive_stripe_webhook(
+    request: Request,
+    stripe_signature: Annotated[str | None, Header(alias="Stripe-Signature")] = None,
+):
+    """Verify, deduplicate, and apply subscription lifecycle events from Stripe."""
+    try:
+        BILLING_CONFIG.require_webhook()
+        event = verify_stripe_signature(
+            await request.body(),
+            stripe_signature,
+            BILLING_CONFIG.webhook_secret or "",
+        )
+    except BillingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except WebhookSignatureError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if supabase is None:
+        raise HTTPException(status_code=503, detail="Database is not configured")
+
+    event_id = str(event["id"])
+    event_type = str(event["type"])
+    supported = {
+        "customer.subscription.created",
+        "customer.subscription.updated",
+        "customer.subscription.deleted",
+    }
+    try:
+        existing = (
+            supabase.table("billing_webhook_events")
+            .select("processing_status")
+            .eq("provider", "stripe")
+            .eq("provider_event_id", event_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data and existing.data[0].get("processing_status") in {"processed", "ignored"}:
+            return {"received": True, "duplicate": True}
+
+        if not existing.data:
+            supabase.table("billing_webhook_events").insert({
+                "provider": "stripe",
+                "provider_event_id": event_id,
+                "event_type": event_type,
+                "processing_status": "processing",
+            }).execute()
+
+        if event_type not in supported:
+            (
+                supabase.table("billing_webhook_events")
+                .update({
+                    "processing_status": "ignored",
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("provider", "stripe")
+                .eq("provider_event_id", event_id)
+                .execute()
+            )
+            return {"received": True, "ignored": True}
+
+        subscription = ((event.get("data") or {}).get("object") or {})
+        subscription_id = str(subscription.get("id") or "")
+        if not subscription_id:
+            raise ValueError("Subscription event is missing its subscription ID")
+        # Stripe doesn't guarantee event delivery order. Fetching the current
+        # subscription prevents a delayed older event from restoring stale access.
+        stripe = _load_stripe_module()
+        current_subscription = stripe.Subscription.retrieve(subscription_id)
+        if hasattr(current_subscription, "to_dict_recursive"):
+            subscription = current_subscription.to_dict_recursive()
+        else:
+            subscription = dict(current_subscription)
+        event_created_at = event.get("created")
+        if not event_is_newer(event_created_at, None):
+            raise ValueError("Subscription event has an invalid creation timestamp")
+        prior = None
+        prior_response = (
+            supabase.table("user_subscriptions")
+            .select("user_id,provider_subscription_id,provider_event_created_at")
+            .eq("provider_subscription_id", subscription_id)
+            .limit(1)
+            .execute()
+        )
+        prior = prior_response.data[0] if prior_response.data else None
+        metadata_user_id = str((subscription.get("metadata") or {}).get("user_id") or "").strip()
+        if prior and metadata_user_id and str(prior.get("user_id")) != metadata_user_id:
+            raise ValueError("Subscription metadata conflicts with the linked account")
+        if prior and not event_is_newer(event_created_at, prior.get("provider_event_created_at")):
+            (
+                supabase.table("billing_webhook_events")
+                .update({
+                    "processing_status": "ignored",
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                    "error_message": "Out-of-order subscription event ignored",
+                })
+                .eq("provider", "stripe")
+                .eq("provider_event_id", event_id)
+                .execute()
+            )
+            return {"received": True, "stale": True}
+        fallback_user_id = prior.get("user_id") if prior else None
+        row = subscription_row_from_stripe(
+            subscription,
+            BILLING_CONFIG,
+            fallback_user_id=fallback_user_id,
+        )
+        if event_type == "customer.subscription.deleted":
+            row["status"] = "canceled"
+        row["provider_event_created_at"] = int(event_created_at)
+        account_subscription = (
+            supabase.table("user_subscriptions")
+            .select("provider_subscription_id,provider_event_created_at")
+            .eq("user_id", row["user_id"])
+            .limit(1)
+            .execute()
+        )
+        if account_subscription.data:
+            linked_id = account_subscription.data[0].get("provider_subscription_id")
+            if linked_id and linked_id != subscription_id:
+                raise ValueError("Account is already linked to another subscription")
+            if not event_is_newer(
+                event_created_at,
+                account_subscription.data[0].get("provider_event_created_at"),
+            ):
+                (
+                    supabase.table("billing_webhook_events")
+                    .update({
+                        "processing_status": "ignored",
+                        "processed_at": datetime.now(timezone.utc).isoformat(),
+                        "error_message": "Out-of-order account event ignored",
+                    })
+                    .eq("provider", "stripe")
+                    .eq("provider_event_id", event_id)
+                    .execute()
+                )
+                return {"received": True, "stale": True}
+            (
+                supabase.table("user_subscriptions")
+                .update(row)
+                .eq("user_id", row["user_id"])
+                .execute()
+            )
+        else:
+            supabase.table("user_subscriptions").insert(row).execute()
+        (
+            supabase.table("billing_webhook_events")
+            .update({
+                "processing_status": "processed",
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+                "error_message": None,
+            })
+            .eq("provider", "stripe")
+            .eq("provider_event_id", event_id)
+            .execute()
+        )
+        return {"received": True, "duplicate": False}
+    except ValueError as exc:
+        logger.warning("Rejected Stripe event %s: %s", event_id, exc)
+        try:
+            (
+                supabase.table("billing_webhook_events")
+                .update({"processing_status": "failed", "error_message": str(exc)[:500]})
+                .eq("provider", "stripe")
+                .eq("provider_event_id", event_id)
+                .execute()
+            )
+        except Exception:
+            logger.exception("Unable to record Stripe event failure %s", event_id)
+        raise HTTPException(status_code=422, detail="The subscription event could not be mapped")
+    except Exception:
+        logger.exception("Stripe webhook processing failed for %s", event_id)
+        raise HTTPException(status_code=500, detail="Webhook processing failed; Stripe may retry")
 
 
 class AlertRuleInput(BaseModel):
@@ -1794,6 +2161,123 @@ def get_market_alerts(
     except Exception:
         logger.exception("Market alert lookup failed")
         raise HTTPException(status_code=502, detail="Market alerts are temporarily unavailable")
+
+
+def enqueue_user_notification(
+    *,
+    user_id: str,
+    event_key: str,
+    event_type: str,
+    title: str,
+    message: str,
+    channels: list[str],
+    payload: dict | None = None,
+) -> dict:
+    """Create one notification event and one delivery per channel, idempotently."""
+    if supabase is None:
+        raise RuntimeError("Database is not configured")
+    event_row = notification_event_row(
+        user_id=user_id,
+        event_key=event_key,
+        event_type=event_type,
+        title=title,
+        message=message,
+        payload=payload,
+    )
+    normalized_channels = normalize_channels(channels)
+    existing = (
+        supabase.table("notifications")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("event_key", event_row["event_key"])
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return {"notification": existing.data[0], "already_recorded": True}
+    saved = supabase.table("notifications").insert(event_row).execute()
+    notification = saved.data[0] if saved.data else event_row
+    notification_id = notification.get("id")
+    if not notification_id:
+        raise RuntimeError("Database did not return a notification ID")
+    supabase.table("notification_deliveries").insert(
+        delivery_rows(notification_id, normalized_channels)
+    ).execute()
+    return {"notification": notification, "already_recorded": False}
+
+
+@app.get("/api/notifications")
+def get_notifications(
+    unread_only: bool = False,
+    limit: int = Query(50, ge=1, le=100),
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Return only the signed-in user's in-app notification inbox."""
+    user_id = get_authenticated_user_id(authorization)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        query = (
+            supabase.table("notifications")
+            .select("id,event_type,title,message,payload,read_at,created_at")
+            .eq("user_id", user_id)
+        )
+        if unread_only:
+            query = query.is_("read_at", "null")
+        response = query.order("created_at", desc=True).limit(limit).execute()
+        notifications = response.data or []
+        return {
+            "notifications": notifications,
+            "unread_count": sum(1 for item in notifications if not item.get("read_at")),
+        }
+    except Exception:
+        logger.exception("Notification inbox lookup failed for %s", user_id)
+        raise HTTPException(status_code=502, detail="Notifications are temporarily unavailable")
+
+
+@app.post("/api/notifications/{notification_id}/read")
+def mark_notification_read(
+    notification_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Mark a notification read only when it belongs to the authenticated user."""
+    user_id = get_authenticated_user_id(authorization)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not re.fullmatch(r"[a-fA-F0-9-]{36}", notification_id):
+        raise HTTPException(status_code=422, detail="Invalid notification ID")
+    try:
+        existing = (
+            supabase.table("notifications")
+            .select("id,read_at")
+            .eq("id", notification_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Notification not found")
+        if existing.data[0].get("read_at"):
+            return {"notification": existing.data[0], "already_read": True}
+        updated = (
+            supabase.table("notifications")
+            .update({"read_at": datetime.now(timezone.utc).isoformat()})
+            .eq("id", notification_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return {
+            "notification": updated.data[0] if updated.data else {
+                "id": notification_id,
+                "read_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "already_read": False,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Notification update failed for %s", user_id)
+        raise HTTPException(status_code=502, detail="Notification could not be updated")
 
 
 @app.get("/api/alert-rules")
