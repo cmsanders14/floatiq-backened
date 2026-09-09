@@ -3,6 +3,11 @@
 FastAPI service that supplies historical candlestick-pattern statistics, position sizing,
 market movers, subscription limits, journals, and morning briefs to the FloatIQ FlutterFlow app.
 
+Production API: `https://api.floatiqanalytics.com`
+
+The legacy Render hostname remains enabled as a fallback, but new client configuration should use
+the branded API hostname.
+
 ## Product tiers
 
 The API is the source of truth for paid access; FlutterFlow must use these values for display,
@@ -67,6 +72,14 @@ Recommended Render commands:
 - Build: `pip install -r requirements.txt`
 - Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Health check path: `/health`
+
+Production smoke test:
+
+```bash
+python scripts/launch_smoke.py \
+  --base-url https://api.floatiqanalytics.com \
+  --require-database
+```
 
 ## Authentication
 
