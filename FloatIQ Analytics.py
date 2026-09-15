@@ -402,7 +402,14 @@ def apply_pattern_entitlements(
         visible = reveal_allowed and item["pattern_key"] == reveal_pattern_key
         result = {**item, "win_rate_locked": not visible}
         if not visible:
-            result["overall_probability_win_rate"] = None
+            if item.get("win_rate_display_allowed") is False:
+                sample_size = int(item.get("sample_size_count") or 0)
+                minimum_size = int(item.get("minimum_sample_size_required") or MINIMUM_WIN_RATE_SAMPLE_SIZE)
+                result["overall_probability_win_rate"] = (
+                    f"Insufficient sample ({sample_size}/{minimum_size})"
+                )
+            else:
+                result["overall_probability_win_rate"] = "Win rate locked — daily reveal"
             result["thirty_day_recent_probability"] = None
             result["historical_win_rate_pct"] = None
             result["confidence_interval_95"] = None
@@ -2291,7 +2298,9 @@ def get_probabilities(
                 "pattern_key": re.sub(r"[^a-z0-9]+", "-", f"{p_name}-{g_type}".lower()).strip("-"),
                 "pattern_headline": f"{p_name} ({g_type})",
                 "overall_probability_win_rate": (
-                    f"{win_rate}%" if claim_status["win_rate_display_allowed"] else None
+                    f"{win_rate}%"
+                    if claim_status["win_rate_display_allowed"]
+                    else f"Insufficient sample ({total}/{MINIMUM_WIN_RATE_SAMPLE_SIZE})"
                 ),
                 "historical_win_rate_pct": (
                     win_rate if claim_status["win_rate_display_allowed"] else None
@@ -2385,7 +2394,8 @@ def get_premade_3pct_scalp_candidates(
         return {"scanner_name": "3% Quick Scalp Radar", "candidates": []}
     scalp_candidates = [
         p for p in raw_data["patterns"]
-        if p.get("overall_probability_win_rate") is not None
+        if p.get("win_rate_display_allowed") is True
+        and p.get("historical_win_rate_pct") is not None
         and float(p["historical_win_rate_pct"]) >= 70.0
         and p["mathematical_expectancy_score"] >= 0.2
     ]

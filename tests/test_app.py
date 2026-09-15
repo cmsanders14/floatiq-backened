@@ -159,7 +159,12 @@ class FloatIQTests(unittest.TestCase):
         self.assertGreater(len(result["patterns"]), 0)
         self.assertLessEqual(len(result["patterns"]), 3)
         self.assertTrue(all(item["win_rate_locked"] for item in result["patterns"]))
-        self.assertTrue(all(item["overall_probability_win_rate"] is None for item in result["patterns"]))
+        self.assertTrue(
+            all(
+                item["overall_probability_win_rate"].startswith("Insufficient sample (")
+                for item in result["patterns"]
+            )
+        )
 
     def test_tier_contract_matches_product_pricing(self):
         free = floatiq.tier_entitlements("free")
@@ -199,6 +204,9 @@ class FloatIQTests(unittest.TestCase):
         )
         self.assertEqual(len(result), 3)
         self.assertTrue(all(item["win_rate_locked"] for item in result))
+        self.assertTrue(
+            all(item["overall_probability_win_rate"] == "Win rate locked — daily reveal" for item in result)
+        )
         self.assertTrue(all(item["historical_win_rate_pct"] is None for item in result))
         self.assertTrue(all(item["confidence_interval_95"] is None for item in result))
 
@@ -308,6 +316,7 @@ class FloatIQTests(unittest.TestCase):
             "patterns": [{
                 "historical_win_rate_pct": 75.0,
                 "overall_probability_win_rate": "75.0%",
+                "win_rate_display_allowed": True,
                 "mathematical_expectancy_score": 1.0,
             }],
             "current_market_environment": "UNKNOWN",
