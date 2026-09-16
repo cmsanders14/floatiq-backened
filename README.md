@@ -89,6 +89,18 @@ python scripts/launch_smoke.py \
   --require-database
 ```
 
+Before changing Render flags or opening the beta, run the deployment preflight against an
+uncommitted environment file. It reports only setting names and safe explanations; credential
+values are never printed:
+
+```bash
+python scripts/deployment_preflight.py --env-file .env --mode production
+```
+
+The check blocks wildcard/non-HTTPS CORS, missing database activation, incomplete billing,
+live-feed flags on the test data adapter, disabled rate limits, unsupported live broker submission,
+and a disengaged broker kill switch. CI separately rejects committed Supabase and Stripe secrets.
+
 ## Authentication
 
 The public pattern endpoint works for guests and applies the free two-chart limit. A caller

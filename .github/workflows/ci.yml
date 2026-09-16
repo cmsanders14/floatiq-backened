@@ -28,10 +28,13 @@ jobs:
       - name: Reject committed Supabase secret keys
         shell: bash
         run: |
-          if git grep -n -E 'sb_sec[r]et_[A-Za-z0-9_-]+' -- ':!demo/**'; then
-            echo 'A Supabase secret key is committed to the repository.' >&2
+          if git grep -n -E '(sb_sec[r]et_[A-Za-z0-9_-]{16,}|sk_l[i]ve_[A-Za-z0-9_-]{16,}|rk_l[i]ve_[A-Za-z0-9_-]{16,}|whs[e]c_[A-Za-z0-9_-]{20,})' -- ':!demo/**'; then
+            echo 'A production credential appears to be committed to the repository.' >&2
             exit 1
           fi
+
+      - name: Validate safe configuration template
+        run: python scripts/deployment_preflight.py --env-file .env.example --mode template
 
       - name: Compile Python sources
         run: python -m compileall -q .
