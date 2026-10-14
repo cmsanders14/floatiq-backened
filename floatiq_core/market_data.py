@@ -51,6 +51,9 @@ def build_market_data_provider() -> MarketDataProvider:
     provider_name = os.getenv("MARKET_DATA_PROVIDER", "yahoo").strip().lower()
     if provider_name == "yahoo":
         return YahooMarketDataProvider()
+    if provider_name == "alpaca":
+        from floatiq_core.alpaca_data import AlpacaMarketDataProvider
+        return AlpacaMarketDataProvider()
     raise RuntimeError(
         f"Unsupported MARKET_DATA_PROVIDER={provider_name!r}. Add the paid provider adapter first."
     )
