@@ -41,14 +41,18 @@ class AlpacaMarketDataProvider:
 
     def download_range(self, ticker, start, end, interval):
         symbol = ticker.strip().upper()
-        if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol):
+        return self.download_many_range([symbol], start, end, interval)[symbol]
+
+    def download_many_range(self, tickers, start, end, interval, max_pages=100):
+        symbols = list(dict.fromkeys(t.strip().upper() for t in tickers))
+        if not symbols or len(symbols) > 50 or any(not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", s) for s in symbols):
             raise AlpacaDataError("Unsupported Alpaca stock symbol")
         if interval not in self._intervals:
             raise AlpacaDataError("Unsupported bar interval")
-        params = dict(symbols=symbol, timeframe=self._intervals[interval], start=start,
+        params = dict(symbols=",".join(symbols), timeframe=self._intervals[interval], start=start,
                       end=end, feed=self.feed, adjustment="all", sort="asc", limit=10000)
-        rows, seen_tokens = [], set()
-        for _ in range(100):
+        rows, seen_tokens = {symbol: [] for symbol in symbols}, set()
+        for _ in range(max_pages):
             request = Request("https://data.alpaca.markets/v2/stocks/bars?" + urlencode(params),
                               headers={"APCA-API-KEY-ID": self._key,
                                        "APCA-API-SECRET-KEY": self._secret,
@@ -63,10 +67,11 @@ class AlpacaMarketDataProvider:
                 raise AlpacaDataError("Alpaca data request unavailable or invalid") from None
             if not isinstance(payload, dict) or not isinstance(payload.get("bars"), dict):
                 raise AlpacaDataError("Alpaca returned an invalid bars response")
-            page = payload["bars"].get(symbol, [])
-            if not isinstance(page, list):
-                raise AlpacaDataError("Alpaca returned invalid symbol bars")
-            rows.extend(page)
+            for symbol in symbols:
+                page = payload["bars"].get(symbol, [])
+                if not isinstance(page, list):
+                    raise AlpacaDataError("Alpaca returned invalid symbol bars")
+                rows[symbol].extend(page)
             token = payload.get("next_page_token")
             if not token:
                 break
@@ -76,6 +81,9 @@ class AlpacaMarketDataProvider:
             params["page_token"] = token
         else:
             raise AlpacaDataError("History request is too large; narrow the date range")
+        return {symbol: self._frame(values) for symbol, values in rows.items()}
+
+    def _frame(self, rows):
         columns = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
         if not rows:
             return pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], tz="UTC"))
@@ -87,6 +95,11 @@ class AlpacaMarketDataProvider:
             frame = frame[columns].apply(pd.to_numeric, errors="raise")
             if frame.isna().any().any() or frame.isin([float("inf"), float("-inf")]).any().any():
                 raise ValueError("Invalid numerical bar")
+            if (frame[["Open", "High", "Low", "Close"]] <= 0).any().any() or (frame["Volume"] < 0).any():
+                raise ValueError("Invalid price or volume")
+            if ((frame["High"] < frame[["Open", "Close", "Low"]].max(axis=1)) |
+                    (frame["Low"] > frame[["Open", "Close", "High"]].min(axis=1))).any():
+                raise ValueError("Inconsistent OHLC bar")
             frame = frame[~frame.index.duplicated(keep="last")].sort_index()
             frame.attrs["provider"] = "alpaca"
             frame.attrs["feed"] = self.feed

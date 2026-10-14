@@ -37,6 +37,7 @@ from floatiq_core.brokers import (
     validate_idempotency_key,
 )
 from floatiq_core.market_data import _MARKET_DATA_CACHE, download_market_data
+from floatiq_core.setup_scanner import SCANNER
 from floatiq_core.market_sessions import (
     assess_market_availability,
     normalize_asset_type,
@@ -79,6 +80,9 @@ SESSION_SCANNER_FEED_ENABLED = (
 )
 SESSION_SCANNER_CACHE_MAX_AGE_SECONDS = max(
     30, int(os.getenv("SESSION_SCANNER_CACHE_MAX_AGE_SECONDS", "120"))
+)
+SETUP_CACHE_MAX_AGE_SECONDS = max(
+    30, int(os.getenv("SETUP_CACHE_MAX_AGE_SECONDS", "120"))
 )
 SCANNER_ALGORITHM_VERSION = os.getenv(
     "SCANNER_ALGORITHM_VERSION", "session_opportunity_v1"
@@ -1967,30 +1971,44 @@ def search_live_setups(
     reveal_ticker: str | None = None,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    """Search the scanner cache and apply the canonical 3/10 tier result contract."""
+    """Search recent scanner records and apply the canonical 3/10 tier contract."""
+    setup = setup.strip()
+    if not setup or any(character in setup for character in ("%", "_", "*")):
+        raise HTTPException(status_code=422, detail="Enter a setup name without wildcard characters")
     verified_user_id = get_authenticated_user_id(authorization)
     permissions = check_user_tier_permissions(verified_user_id or "guest_user", "free")
     if chart_slot > permissions["max_charts"]:
         raise HTTPException(status_code=403, detail="Chart slot is not included in this subscription tier")
-    if supabase is None:
+    if supabase is None and os.getenv("MARKET_DATA_PROVIDER", "yahoo").lower() != "alpaca":
         raise HTTPException(status_code=503, detail="Live setup search is not configured")
 
+    checked_at = datetime.now(timezone.utc)
+    cutoff = checked_at - timedelta(seconds=SETUP_CACHE_MAX_AGE_SECONDS)
+    scan_metadata = {}
     try:
-        response = (
-            supabase.table("live_scan_cache")
-            .select("ticker,pattern_detected,current_price,current_rvol,gap_fill_probability,market_session,updated_at")
-            .ilike("pattern_detected", f"%{setup.strip()}%")
-            .order("gap_fill_probability", desc=True)
-            .limit(permissions["pattern_result_limit"])
-            .execute()
-        )
+        if os.getenv("MARKET_DATA_PROVIDER", "yahoo").lower() == "alpaca":
+            rows, scan_metadata = SCANNER.search(setup, checked_at)
+            rows = rows[:permissions["pattern_result_limit"]]
+        else:
+            response = (
+                supabase.table("live_scan_cache")
+                .select("ticker,pattern_detected,current_price,current_rvol,gap_fill_probability,market_session,updated_at")
+                .ilike("pattern_detected", f"%{setup}%")
+                .gte("updated_at", cutoff.isoformat())
+                .lte("updated_at", checked_at.isoformat())
+                .order("gap_fill_probability", desc=True)
+                .limit(permissions["pattern_result_limit"])
+                .execute()
+            )
+            rows = response.data or []
     except Exception:
         logger.exception("Live setup search failed")
         raise HTTPException(status_code=502, detail="Live setup search is temporarily unavailable")
 
     normalized_reveal = normalize_ticker(reveal_ticker) if reveal_ticker else None
     returned_tickers = {
-        normalize_ticker(str(row.get("ticker", ""))) for row in (response.data or [])
+        normalize_ticker(str(row.get("ticker", ""))) for row in rows
+        if row.get("gap_fill_probability") is not None
     }
     reveal_key = (
         f"setup:{setup.strip().lower()}:{normalized_reveal}"
@@ -2004,7 +2022,7 @@ def search_live_setups(
         )
 
     candidates = []
-    for row in response.data or []:
+    for row in rows:
         ticker = normalize_ticker(str(row.get("ticker", "")))
         win_rate_visible = permissions["win_rate_access"] == "all" or (
             reveal_allowed and ticker == normalized_reveal
@@ -2023,6 +2041,10 @@ def search_live_setups(
         "result_limit": permissions["pattern_result_limit"],
         "max_allowed_charts": permissions["max_charts"],
         "daily_reveal_requires_sign_in": permissions["tier"] == "free" and verified_user_id is None,
+        "checked_at": checked_at.isoformat(),
+        "max_record_age_seconds": SETUP_CACHE_MAX_AGE_SECONDS,
+        "data_status": "recent_cache_matches" if candidates else "no_recent_matches",
+        **scan_metadata,
         "candidates": candidates,
     }
 
@@ -2087,7 +2109,10 @@ def get_probabilities(
                 "win_rate_access": permissions["win_rate_access"],
                 "target_return_pct": target_return_pct,
                 "patterns": [],
-                "data_status": "unavailable",
+                "data_status": "unavailable" if df.empty else "insufficient_history",
+                "bars_available": len(df),
+                "minimum_bars_required": 25,
+                "message": "Market data is temporarily unavailable." if df.empty else "Not enough history. Select a longer date range or a shorter candle interval.",
             }
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)

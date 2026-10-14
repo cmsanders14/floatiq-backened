@@ -12,6 +12,21 @@ def bar(day):
 
 
 class AlpacaTests(unittest.TestCase):
+    def test_batch_pagination_does_not_drop_later_symbols(self):
+        p = self.provider([{"bars": {"AAPL": [bar(12)]}, "next_page_token": "next"},
+                           {"bars": {"TSLA": [bar(13)]}, "next_page_token": None}])
+        frames = p.download_many_range(["AAPL", "TSLA"], "2026-10-12", "2026-10-14", "15m")
+        self.assertEqual(len(frames["AAPL"]), 1)
+        self.assertEqual(len(frames["TSLA"]), 1)
+        self.assertEqual(parse_qs(urlparse(self.requests[0].full_url).query)["symbols"], ["AAPL,TSLA"])
+
+    def test_invalid_ohlc_rejected(self):
+        bad = bar(12)
+        bad['h'] = 1
+        p = self.provider([{"bars": {"AAPL": [bad]}}])
+        with self.assertRaises(AlpacaDataError):
+            p.download("AAPL", "1d", "1m")
+
     def test_render_credential_names(self):
         with patch.dict("os.environ", {"APCA_API_KEY_ID": "test-key", "APCA_API_SECRET_KEY": "test-secret"}, clear=True):
             p = AlpacaMarketDataProvider()
