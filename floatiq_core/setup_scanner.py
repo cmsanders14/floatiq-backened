@@ -1,5 +1,6 @@
 """On-demand, bounded setup scanning. No database writes or order calls."""
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,32 @@ BAR_SECONDS = 900
 MAX_AGE_SECONDS = 1200
 NY = ZoneInfo("America/New_York")
 SUPPORTED = ["bull", "bear", "engulfing", "breakout", "breakdown"]
+
+
+def historical_ticker_row(symbol, frame, now, feed, sessions):
+    """Chart discovery only: never present an old candle as a fresh setup."""
+    if frame.empty:
+        return None
+    completed = frame.loc[frame.index + timedelta(seconds=BAR_SECONDS) <= now]
+    mask = [any(opening <= started and started + timedelta(seconds=BAR_SECONDS) <= closing
+                for opening, closing in sessions) for started in completed.index]
+    completed = completed.loc[mask]
+    if completed.empty:
+        return None
+    started = completed.index[-1]
+    ended = started + timedelta(seconds=BAR_SECONDS)
+    stamp = ended.tz_convert(NY).strftime('%Y-%m-%d %H:%M %Z')
+    return {
+        "ticker": symbol, "pattern_detected": f"Last regular-session bar · {stamp}",
+        "current_price": float(completed.iloc[-1].Close), "current_rvol": None,
+        "market_session": "regular", "updated_at": ended.isoformat(),
+        "observed_at": ended.isoformat(), "bar_started_at": started.isoformat(),
+        "price_label": "Last available regular-session bar close",
+        "is_live_setup": False, "is_official_closing_price": False,
+        "interval": "15m", "source": "alpaca", "feed": feed,
+        "gap_fill_probability": None, "sample_size_count": 0,
+        "statistical_claim_status": "not_estimated", "win_rate_display_allowed": False,
+    }
 
 
 def detect_setups(symbol, frame, now, feed):
@@ -68,12 +95,42 @@ class SetupScanner:
         self._refreshed = 0
         self._failed_until = 0
         self._feed = None
+        self._ticker_cache = {}
+
+    def lookup_ticker(self, symbol, now):
+        if not self._lock.acquire(timeout=2):
+            raise AlpacaDataError("Ticker lookup is busy; retry shortly")
+        try:
+            clock = time.monotonic()
+            cached = self._ticker_cache.get(symbol)
+            if cached is None or clock - cached[0] >= 60:
+                provider = self.provider_factory()
+                frames = provider.download_many_range(
+                    [symbol], (now-timedelta(days=14)).isoformat(), now.isoformat(),
+                    "15m", max_pages=2)
+                sessions = provider.market_calendar((now-timedelta(days=14)).date().isoformat(), now.date().isoformat())
+                cached = (clock, frames.get(symbol), provider.feed, sessions)
+                if len(self._ticker_cache) >= 64:
+                    self._ticker_cache.pop(next(iter(self._ticker_cache)))
+                self._ticker_cache[symbol] = cached
+            row = historical_ticker_row(symbol, cached[1], now, cached[2], cached[3]) if cached[1] is not None else None
+            return ([row] if row else []), {
+                "checked_at": now.isoformat(), "data_status": "historical_ticker" if row else "ticker_unavailable",
+                "search_mode": "ticker", "source": "alpaca", "feed": cached[2],
+                "coverage": "requested_symbol", "symbols_requested": 1,
+                "message": ("Last available regular-session bar; not a live setup or official consolidated closing price. Open the chart to view history."
+                            if row else "No recent regular-session history for this ticker. Check the symbol and try again."),
+            }
+        finally:
+            self._lock.release()
 
     def search(self, setup, now=None):
         now = now or datetime.now(timezone.utc)
         query = setup.lower().strip()
         aliases = {"bullish": "bull", "bearish": "bear", "bullish engulfing": "bullish engulfing", "bearish engulfing": "bearish engulfing"}
         query = aliases.get(query, query)
+        if query not in SUPPORTED and query not in {"bullish engulfing", "bearish engulfing"} and re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{0,14}", setup.strip()):
+            return self.lookup_ticker(setup.strip().upper(), now)
         if not any(term in query for term in SUPPORTED):
             return [], self._metadata(now, "unsupported_setup", 0)
         if not self._lock.acquire(timeout=2):

@@ -39,6 +39,29 @@ class AlpacaMarketDataProvider:
             raise AlpacaDataError("Unsupported history period")
         return self.download_range(ticker, start.isoformat(), end.isoformat(), interval)
 
+    def market_calendar(self, start, end):
+        """Read session dates/hours, including holidays and early closes. No orders."""
+        request = Request("https://paper-api.alpaca.markets/v2/calendar?" + urlencode({"start": start, "end": end}),
+                          headers={"APCA-API-KEY-ID": self._key, "APCA-API-SECRET-KEY": self._secret,
+                                   "Accept": "application/json"})
+        try:
+            with self._opener(request, timeout=20) as response:
+                rows = json.load(response)
+            if not isinstance(rows, list):
+                raise ValueError("Invalid calendar")
+            from zoneinfo import ZoneInfo
+            ny = ZoneInfo("America/New_York")
+            sessions = []
+            for row in rows:
+                opening = datetime.fromisoformat(row['date'] + 'T' + row['open']).replace(tzinfo=ny)
+                closing = datetime.fromisoformat(row['date'] + 'T' + row['close']).replace(tzinfo=ny)
+                if closing <= opening:
+                    raise ValueError("Invalid session")
+                sessions.append((opening, closing))
+            return sessions
+        except (HTTPError, URLError, TimeoutError, ValueError, KeyError, TypeError):
+            raise AlpacaDataError("Market calendar temporarily unavailable") from None
+
     def download_range(self, ticker, start, end, interval):
         symbol = ticker.strip().upper()
         return self.download_many_range([symbol], start, end, interval)[symbol]
