@@ -7,4 +7,4 @@ yfinance==1.7.0
 supabase==2.31.0
 python-dotenv==1.2.3
 TA-Lib==0.7.1
-stripe>=13,<16
+stripe>=15.6.1,<16
